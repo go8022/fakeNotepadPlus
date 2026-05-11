@@ -1,0 +1,29 @@
+╔══════════════════════════════════════════════╗
+║          Welcome to Phil Notepad+            ║
+╚══════════════════════════════════════════════╝
+
+  A lightweight, Notepad++-style editor.
+
+  Keyboard shortcuts
+  ──────────────────────────────────────
+  Ctrl+N        New file
+  Ctrl+O        Open file
+  Ctrl+S        Save
+  Ctrl+Shift+S  Save As
+  Ctrl+W        Close tab
+  Ctrl+F        Find
+  Ctrl+H        Find & Replace
+  Ctrl+G        Go to line
+  Ctrl+D        Duplicate line
+  Ctrl+Tab      Next tab
+  Ctrl++        Zoom in
+  Ctrl+-        Zoom out
+  Ctrl+0        Reset zoom
+
+  Supported languages
+  ──────────────────────────────────────
+  Python · C++ · JavaScript · HTML · CSS
+  JSON · SQL · Markdown · YAML · TOML
+  Plain Text
+
+  Tip: Drag and drop one or more files onto the window to open them instantly.

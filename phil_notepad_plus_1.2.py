@@ -11,7 +11,11 @@ import os
 import re
 import sys
 import ctypes
+import tempfile
+import textwrap
+import webbrowser
 from ctypes import wintypes
+from html import escape as html_escape
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, filedialog, messagebox, simpledialog, font as tkfont
@@ -24,6 +28,7 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _SESSION_FILE: str = os.path.join(_BASE_DIR, "phil_notepad_plus.tmp")
+_HISTORY_FILE: str = os.path.join(_BASE_DIR, "phil_notepad_plus_history.tmp")
 
 # ─── Syntax definitions ────────────────────────────────────────────────
 SYNTAX: Dict[str, Dict[str, str]] = {
@@ -97,7 +102,7 @@ SYNTAX: Dict[str, Dict[str, str]] = {
         "keywords": r'\b(true|false|null)\b',
     },
     "SQL": {
-        "keywords": r"\b(?i)(SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|"
+        "keywords": r"(?i)\b(SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|"
                     r"CREATE|DROP|ALTER|TABLE|INDEX|VIEW|JOIN|INNER|LEFT|RIGHT|OUTER|"
                     r"ON|AND|OR|NOT|IN|BETWEEN|LIKE|IS|NULL|AS|ORDER|BY|GROUP|HAVING|"
                     r"LIMIT|OFFSET|UNION|EXISTS|DISTINCT|COUNT|SUM|AVG|MAX|MIN|CASE|"
@@ -149,6 +154,16 @@ EXT_MAP: Dict[str, str] = {
     ".yaml": "YAML", ".yml": "YAML",
     ".toml": "TOML",
 }
+
+TEXT_FILE_EXTENSIONS = set(EXT_MAP) | {
+    ".txt", ".text", ".log",
+    ".csv", ".tsv", ".srt",
+    ".ini", ".cfg", ".conf",
+    ".bat", ".cmd", ".ps1", ".sh",
+}
+
+A4_SIZE_MM: Tuple[int, int] = (210, 297)
+PRINT_MARGIN_MM: int = 15
 
 # ─── Theme colour palettes ──────────────────────────────────────────────
 THEMES: Dict[str, Dict[str, Any]] = {
@@ -236,16 +251,25 @@ class EditorTab:
         frame: tk.Frame,
         text: tk.Text,
         line_nums: "LineNumbers",
+        hscroll: Optional[tk.Scrollbar] = None,
+        margin_guide: Optional[tk.Frame] = None,
         filepath: Optional[str] = None,
         language: str = "Plain Text",
+        last_known_size: Optional[int] = None,
+        last_known_mtime: Optional[float] = None,
     ) -> None:
         self.frame: tk.Frame = frame
         self.text: tk.Text = text
         self.line_nums: LineNumbers = line_nums
+        self.hscroll: Optional[tk.Scrollbar] = hscroll
+        self.margin_guide: Optional[tk.Frame] = margin_guide
         self.filepath: Optional[str] = filepath
         self.language: str = language
         self.modified: bool = False
         self.encoding: str = "UTF-8"
+        self.last_known_size: Optional[int] = last_known_size
+        self.last_known_mtime: Optional[float] = last_known_mtime
+        self.needs_reload: bool = False
 
 
 class PhilNotepadPlus:
@@ -265,12 +289,16 @@ class PhilNotepadPlus:
         self.font_size: int = self.base_font_size
         self.font_family: str = "Consolas"
         self.word_wrap: bool = False
+        self.show_a4_margin_guide: bool = True
         self.recent_files: List[str] = []
+        self.file_history: Dict[str, Dict[str, Any]] = {}
+        self._untitled_counter: int = 1
 
         self._build_menu()
         self._build_notebook()
         self._build_status_bar()
         self._bind_shortcuts()
+        self._load_history()
         self.root.after(0, self._enable_file_drag_drop)
 
         # Restore session or show welcome tab
@@ -313,6 +341,7 @@ class PhilNotepadPlus:
 
         # Override window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(2000, self._check_external_file_changes)
 
     # ── session persistence ─────────────────────────────────────────────
     def _save_session(self) -> None:
@@ -336,6 +365,8 @@ class PhilNotepadPlus:
                         "language": tab.language,
                         "cursor": cursor,
                         "scroll": scroll_pos,
+                        "last_known_size": tab.last_known_size,
+                        "last_known_mtime": tab.last_known_mtime,
                     })
             if self.current_tab:
                 try:
@@ -351,6 +382,7 @@ class PhilNotepadPlus:
                 "theme_name": self.theme_name,
                 "font_size": self.font_size,
                 "word_wrap": self.word_wrap,
+                "show_a4_margin_guide": self.show_a4_margin_guide,
                 "last_saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             with open(_SESSION_FILE, "w", encoding="utf-8") as f:
@@ -377,7 +409,9 @@ class PhilNotepadPlus:
             self.theme = THEMES.get(self.theme_name, THEMES["Dark"])
             self.font_size = session.get("font_size", self.base_font_size)
             self.word_wrap = session.get("word_wrap", False)
-            self.recent_files = session.get("recent_files", [])
+            self.show_a4_margin_guide = session.get("show_a4_margin_guide", True)
+            session_recent = session.get("recent_files", [])
+            self.recent_files = self._merge_recent_files(self.recent_files, session_recent)
             self._rebuild_recent_menu()
         except Exception:
             pass
@@ -403,7 +437,23 @@ class PhilNotepadPlus:
 
             lang: str = tab_info.get("language", "Plain Text")
             title: str = os.path.basename(fp)
-            self._new_tab(title=title, content=content, filepath=fp, language=lang)
+            size = tab_info.get("last_known_size")
+            if size is None:
+                size = self._get_file_size(fp)
+            mtime = tab_info.get("last_known_mtime")
+            if mtime is None:
+                mtime = self._get_file_mtime(fp)
+            if not self._can_open_file_path(fp, show_message=False):
+                continue
+            self._new_tab(
+                title=title,
+                content=content,
+                filepath=fp,
+                language=lang,
+                last_known_size=size,
+                last_known_mtime=mtime,
+            )
+            self._record_file_history(fp)
             restored_count += 1
 
             # Restore cursor and scroll
@@ -438,13 +488,108 @@ class PhilNotepadPlus:
             self.recent_menu.delete(0, "end")
             for p in self.recent_files:
                 self.recent_menu.add_command(
-                    label=p, command=lambda pp=p: self._open_recent(pp)
+                    label=self._recent_menu_label(p), command=lambda pp=p: self._open_recent(pp)
                 )
         except Exception:
             pass
 
+    def _load_history(self) -> None:
+        """Load durable file-open history independent of session restore."""
+        if not os.path.exists(_HISTORY_FILE):
+            self._rebuild_recent_menu()
+            return
+        try:
+            with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+                history: Dict[str, Any] = json.load(f)
+        except Exception:
+            self._rebuild_recent_menu()
+            return
+
+        files = history.get("files", {})
+        if isinstance(files, dict):
+            self.file_history = {
+                path: info for path, info in files.items()
+                if isinstance(path, str) and isinstance(info, dict)
+            }
+
+        recent = history.get("recent_files", [])
+        if isinstance(recent, list):
+            self.recent_files = [
+                path for path in recent
+                if isinstance(path, str) and path
+            ][:20]
+        self._rebuild_recent_menu()
+
+    def _save_history(self) -> None:
+        """Persist recent files and their last known sizes immediately."""
+        try:
+            history = {
+                "recent_files": self.recent_files[:20],
+                "files": self.file_history,
+                "last_saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _merge_recent_files(self, *groups: List[str]) -> List[str]:
+        merged: List[str] = []
+        for group in groups:
+            for path in group:
+                if isinstance(path, str) and path and path not in merged:
+                    merged.append(path)
+        return merged[:20]
+
+    def _get_file_size(self, path: str) -> Optional[int]:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return None
+
+    def _get_file_mtime(self, path: str) -> Optional[float]:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return None
+
+    def _format_file_size(self, size: Optional[int]) -> str:
+        if size is None:
+            return "size unknown"
+        units = ("B", "KB", "MB", "GB", "TB")
+        value = float(size)
+        unit = units[0]
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                break
+            value /= 1024
+        if unit == "B":
+            return f"{int(value)} {unit}"
+        return f"{value:.1f} {unit}"
+
+    def _recent_menu_label(self, path: str) -> str:
+        info = self.file_history.get(path, {})
+        size = info.get("last_size")
+        return f"{path}    [{self._format_file_size(size)}]"
+
+    def _record_file_history(self, path: str) -> None:
+        size = self._get_file_size(path)
+        mtime = self._get_file_mtime(path)
+        self.file_history[path] = {
+            "last_size": size,
+            "last_mtime": mtime,
+            "last_opened": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for tab in self.tabs:
+            if tab.filepath == path:
+                tab.last_known_size = size
+                tab.last_known_mtime = mtime
+                tab.needs_reload = False
+                self._update_tab_title(tab)
+
     def _on_close(self) -> None:
         """Handle window close: save session then exit."""
+        self._save_history()
         self._save_session()
         self.root.destroy()
 
@@ -459,6 +604,9 @@ class PhilNotepadPlus:
         file_menu.add_separator()
         file_menu.add_command(label="Save             Ctrl+S", command=self._save_file)
         file_menu.add_command(label="Save As…  Ctrl+Shift+S", command=self._save_file_as)
+        file_menu.add_command(label="Reload File", command=self._reload_current_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="Print…           Ctrl+P", command=self._print_preview)
         file_menu.add_separator()
         file_menu.add_command(label="Close Tab        Ctrl+W", command=self._close_tab)
         file_menu.add_separator()
@@ -496,12 +644,18 @@ class PhilNotepadPlus:
         view_menu.add_command(label="Reset Zoom       Ctrl+0", command=self._zoom_reset)
         view_menu.add_separator()
         view_menu.add_command(label="Toggle Word Wrap", command=self._toggle_word_wrap)
+        view_menu.add_command(label="Toggle A4 Margin Guide", command=self._toggle_a4_margin_guide)
         view_menu.add_separator()
         self.theme_menu: tk.Menu = tk.Menu(view_menu, tearoff=0)
         self.theme_menu.add_command(label="Dark", command=lambda: self._set_theme("Dark"))
         self.theme_menu.add_command(label="Light", command=lambda: self._set_theme("Light"))
         view_menu.add_cascade(label="Theme", menu=self.theme_menu)
         self.menubar.add_cascade(label="View", menu=view_menu)
+
+        # Window
+        self.window_menu: tk.Menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Window", menu=self.window_menu)
+        self._rebuild_window_menu()
 
         # Language
         lang_menu = tk.Menu(self.menubar, tearoff=0)
@@ -523,6 +677,8 @@ class PhilNotepadPlus:
         self.notebook: ttk.Notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.notebook.bind("<Button-3>", self._show_tab_menu)
+        self.notebook.bind("<Button-2>", self._close_tab_at_event)
 
     # ── status bar ──────────────────────────────────────────────────────
     def _build_status_bar(self) -> None:
@@ -541,8 +697,10 @@ class PhilNotepadPlus:
             pos = tab.text.index(tk.INSERT)
             line, col = pos.split(".")
             total = int(tab.text.index("end-1c").split(".")[0])
+            size_text = self._format_file_size(tab.last_known_size)
+            reload_text = "    |    Reload available" if tab.needs_reload else ""
             self.status_left.config(
-                text=f"  Ln {line}, Col {int(col)+1}    |    Lines: {total}    |    {tab.language}"
+                text=f"  Ln {line}, Col {int(col)+1}    |    Lines: {total}    |    {tab.language}    |    Size: {size_text}{reload_text}"
             )
             self.status_right.config(text=f"{tab.encoding}    Zoom: {self.font_size}pt  ")
         except Exception:
@@ -558,6 +716,8 @@ class PhilNotepadPlus:
         r.bind("<Control-s>", lambda e: self._save_file())
         r.bind("<Control-S>", lambda e: self._save_file())
         r.bind("<Control-Shift-S>", lambda e: self._save_file_as())
+        r.bind("<Control-p>", lambda e: self._print_preview())
+        r.bind("<Control-P>", lambda e: self._print_preview())
         r.bind("<Control-w>", lambda e: self._close_tab())
         r.bind("<Control-W>", lambda e: self._close_tab())
         r.bind("<Control-f>", lambda e: self._open_find())
@@ -569,6 +729,7 @@ class PhilNotepadPlus:
         r.bind("<Control-d>", lambda e: self._duplicate_line())
         r.bind("<Control-D>", lambda e: self._duplicate_line())
         r.bind("<Control-Tab>", lambda e: self._next_tab())
+        r.bind("<Control-Shift-Tab>", lambda e: self._previous_tab())
         r.bind("<Control-plus>", lambda e: self._zoom_in())
         r.bind("<Control-equal>", lambda e: self._zoom_in())
         r.bind("<Control-minus>", lambda e: self._zoom_out())
@@ -629,22 +790,173 @@ class PhilNotepadPlus:
         """Open files that are dropped onto the app window."""
         shell32 = ctypes.windll.shell32
         count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+        skipped: List[str] = []
         for idx in range(count):
             length = shell32.DragQueryFileW(hdrop, idx, None, 0)
             buffer = ctypes.create_unicode_buffer(length + 1)
             shell32.DragQueryFileW(hdrop, idx, buffer, length + 1)
             path = buffer.value
-            if os.path.isfile(path):
+            if not os.path.isfile(path):
+                continue
+            if self._is_text_file(path):
                 self._open_dropped_file(path)
+            else:
+                skipped.append(path)
         shell32.DragFinish(hdrop)
+        if skipped:
+            names = "\n".join(os.path.basename(path) for path in skipped[:8])
+            if len(skipped) > 8:
+                names += f"\n... and {len(skipped) - 8} more"
+            messagebox.showwarning(
+                "Drag & Drop",
+                "Only text-format files can be opened by drag and drop:\n\n" + names,
+            )
 
-    def _open_dropped_file(self, path: str) -> None:
+    def _is_text_file(self, path: str) -> bool:
+        """Return True when *path* looks like a text-format file."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext and ext not in TEXT_FILE_EXTENSIONS:
+            return False
+        try:
+            with open(path, "rb") as f:
+                sample = f.read(4096)
+        except Exception:
+            return False
+        if b"\x00" in sample:
+            return False
+        if not sample:
+            return True
+        control_chars = sum(
+            1 for b in sample
+            if b < 32 and b not in (9, 10, 12, 13)
+        )
+        return control_chars / len(sample) < 0.05
+
+    def _read_text_file(self, path: str) -> str:
+        """Read a text file using UTF-8 first, then latin-1 as a fallback."""
         try:
             with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
+                return f.read()
         except UnicodeDecodeError:
             with open(path, "r", encoding="latin-1") as f:
-                content = f.read()
+                return f.read()
+
+    def _normalize_path(self, path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def _find_open_tab_by_path(self, path: str) -> Optional[EditorTab]:
+        target = self._normalize_path(path)
+        for tab in self.tabs:
+            if tab.filepath and self._normalize_path(tab.filepath) == target:
+                return tab
+        return None
+
+    def _find_open_tab_by_name(self, filename: str, exclude: Optional[EditorTab] = None) -> Optional[EditorTab]:
+        target = filename.lower()
+        for tab in self.tabs:
+            if tab is exclude:
+                continue
+            if self._tab_title(tab).lower() == target:
+                return tab
+        return None
+
+    def _focus_existing_open_file(self, tab: EditorTab, reason: str) -> None:
+        self._select_tab(tab)
+        messagebox.showinfo("Open File", f"{reason}\n\nSwitched to the existing tab.")
+
+    def _can_open_file_path(self, path: str, show_message: bool = True) -> bool:
+        same_path_tab = self._find_open_tab_by_path(path)
+        if same_path_tab:
+            if show_message:
+                self._focus_existing_open_file(same_path_tab, "This file is already open.")
+            else:
+                self._select_tab(same_path_tab)
+            return False
+
+        same_name_tab = self._find_open_tab_by_name(os.path.basename(path))
+        if same_name_tab:
+            if show_message:
+                self._focus_existing_open_file(
+                    same_name_tab,
+                    "A file with the same name is already open.",
+                )
+            else:
+                self._select_tab(same_name_tab)
+            return False
+        return True
+
+    def _next_untitled_title(self) -> str:
+        existing = {self._tab_title(tab).lower() for tab in self.tabs}
+        while True:
+            title = "Untitled" if self._untitled_counter == 1 else f"Untitled {self._untitled_counter}"
+            self._untitled_counter += 1
+            if title.lower() not in existing:
+                return title
+
+    def _check_external_file_changes(self) -> None:
+        """Mark open tabs when their backing files change outside the app."""
+        try:
+            for tab in list(self.tabs):
+                if not tab.filepath or not os.path.exists(tab.filepath):
+                    continue
+                size = self._get_file_size(tab.filepath)
+                mtime = self._get_file_mtime(tab.filepath)
+                if tab.last_known_size is None and tab.last_known_mtime is None:
+                    tab.last_known_size = size
+                    tab.last_known_mtime = mtime
+                    continue
+                if size != tab.last_known_size or mtime != tab.last_known_mtime:
+                    if not tab.needs_reload:
+                        tab.needs_reload = True
+                        self._update_tab_title(tab)
+                        self._update_status()
+                        self._rebuild_window_menu()
+        finally:
+            self.root.after(2000, self._check_external_file_changes)
+
+    def _reload_current_file(self) -> None:
+        tab = self.current_tab
+        if tab:
+            self._reload_tab(tab)
+
+    def _reload_tab(self, tab: EditorTab) -> None:
+        if not tab.filepath:
+            return
+        if tab.text.edit_modified():
+            ans = messagebox.askyesnocancel(
+                "Reload File",
+                "This tab has unsaved edits. Reload from disk and discard those edits?",
+            )
+            if ans is not True:
+                return
+        try:
+            content = self._read_text_file(tab.filepath)
+        except Exception as exc:
+            messagebox.showerror("Reload File", f"Unable to reload file:\n{tab.filepath}\n\n{exc}")
+            return
+        tab.text.delete("1.0", "end")
+        tab.text.insert("1.0", content)
+        tab.text.edit_modified(False)
+        tab.modified = False
+        tab.needs_reload = False
+        tab.last_known_size = self._get_file_size(tab.filepath)
+        tab.last_known_mtime = self._get_file_mtime(tab.filepath)
+        tab.language = EXT_MAP.get(os.path.splitext(tab.filepath)[1].lower(), tab.language)
+        self._select_tab(tab)
+        self._update_tab_title(tab)
+        self._highlight_syntax()
+        self._redraw_line_numbers()
+        self._update_status()
+        self._rebuild_window_menu()
+        self._record_file_history(tab.filepath)
+        self._save_history()
+        self._save_session()
+
+    def _open_dropped_file(self, path: str) -> None:
+        if not self._can_open_file_path(path):
+            return
+        try:
+            content = self._read_text_file(path)
         except Exception as exc:
             messagebox.showerror("Open File", f"Unable to open dropped file:\n{path}\n\n{exc}")
             return
@@ -655,7 +967,7 @@ class PhilNotepadPlus:
         self._add_recent(path)
 
     # ── tab helpers ─────────────────────────────────────────────────────
-    def _make_editor(self, parent: tk.Frame) -> Tuple[tk.Text, LineNumbers]:
+    def _make_editor(self, parent: tk.Frame) -> Tuple[tk.Text, LineNumbers, Optional[tk.Scrollbar], tk.Frame]:
         """Create a text widget + line-number canvas inside *parent* frame."""
         frame = tk.Frame(parent)
         frame.pack(fill="both", expand=True)
@@ -677,12 +989,15 @@ class PhilNotepadPlus:
             tabs=("4c",),
         )
         text.pack(side="left", fill="both", expand=True)
+        margin_guide = tk.Frame(text, width=1, bg=self._a4_margin_guide_color())
+        margin_guide.place_forget()
 
         # Scrollbars
         vscroll = tk.Scrollbar(frame, orient="vertical", command=text.yview)
         vscroll.pack(side="right", fill="y")
         text.config(yscrollcommand=vscroll.set)
 
+        hscroll: Optional[tk.Scrollbar] = None
         if not self.word_wrap:
             hscroll = tk.Scrollbar(parent, orient="horizontal", command=text.xview)
             hscroll.pack(side="bottom", fill="x")
@@ -694,10 +1009,29 @@ class PhilNotepadPlus:
         text.bind("<KeyRelease>", self._on_key_release)
         text.bind("<ButtonRelease-1>", self._on_key_release)
         text.bind("<MouseWheel>", self._on_scroll)
-        text.bind("<Configure>", lambda e: self._redraw_line_numbers())
+        text.bind("<Configure>", lambda e: (self._redraw_line_numbers(), self._update_a4_margin_guides()))
         text.bind("<Button-3>", self._context_menu)
 
-        return text, line_nums
+        return text, line_nums, hscroll, margin_guide
+
+    def _clean_tab_title(self, title: str) -> str:
+        title = title.strip()
+        if title.startswith("*"):
+            title = title[1:].strip()
+        if title.endswith("[Reload]"):
+            title = title[:-8].strip()
+        return title or "Untitled"
+
+    def _update_tab_title(self, tab: EditorTab) -> None:
+        if tab not in self.tabs:
+            return
+        idx = self.notebook.index(tab.frame)
+        title = os.path.basename(tab.filepath) if tab.filepath else self._tab_title(tab)
+        if tab.modified or tab.text.edit_modified():
+            title = f"*{title}"
+        if tab.needs_reload:
+            title = f"{title} [Reload]"
+        self.notebook.tab(idx, text=f"  {title}  ")
 
     def _new_tab(
         self,
@@ -705,20 +1039,29 @@ class PhilNotepadPlus:
         content: str = "",
         filepath: Optional[str] = None,
         language: str = "Plain Text",
+        last_known_size: Optional[int] = None,
+        last_known_mtime: Optional[float] = None,
     ) -> None:
         outer = tk.Frame(self.notebook)
-        text, line_nums = self._make_editor(outer)
+        text, line_nums, hscroll, margin_guide = self._make_editor(outer)
         if content:
             text.insert("1.0", content)
-        tab = EditorTab(outer, text, line_nums, filepath, language)
+        if filepath and last_known_size is None:
+            last_known_size = self._get_file_size(filepath)
+        if filepath and last_known_mtime is None:
+            last_known_mtime = self._get_file_mtime(filepath)
+        tab = EditorTab(outer, text, line_nums, hscroll, margin_guide, filepath, language, last_known_size, last_known_mtime)
         self.tabs.append(tab)
         self.notebook.add(outer, text=f"  {title}  ")
+        self._update_tab_title(tab)
         self.notebook.select(outer)
         self.current_tab = tab
         text.edit_modified(False)
         self._highlight_syntax()
         self._redraw_line_numbers()
+        self._update_a4_margin_guides()
         self._update_status()
+        self._rebuild_window_menu()
 
     def _get_tab_for_frame(self, frame: Any) -> Optional[EditorTab]:
         for tab in self.tabs:
@@ -738,10 +1081,11 @@ class PhilNotepadPlus:
             self._highlight_syntax()
             self._redraw_line_numbers()
             self._update_status()
+            self._rebuild_window_menu()
 
     # ── file operations ─────────────────────────────────────────────────
     def _new_file(self) -> None:
-        self._new_tab()
+        self._new_tab(title=self._next_untitled_title())
 
     def _open_file(self) -> None:
         path = filedialog.askopenfilename(filetypes=[
@@ -760,12 +1104,13 @@ class PhilNotepadPlus:
         ])
         if not path:
             return
+        if not self._can_open_file_path(path):
+            return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="latin-1") as f:
-                content = f.read()
+            content = self._read_text_file(path)
+        except Exception as exc:
+            messagebox.showerror("Open File", f"Unable to open file:\n{path}\n\n{exc}")
+            return
         ext = os.path.splitext(path)[1].lower()
         lang = EXT_MAP.get(ext, "Plain Text")
         title = os.path.basename(path)
@@ -797,12 +1142,22 @@ class PhilNotepadPlus:
         ])
         if not path:
             return
+        same_path_tab = self._find_open_tab_by_path(path)
+        if same_path_tab and same_path_tab is not tab:
+            self._focus_existing_open_file(same_path_tab, "Another tab is already using this file.")
+            return
+        same_name_tab = self._find_open_tab_by_name(os.path.basename(path), exclude=tab)
+        if same_name_tab:
+            self._focus_existing_open_file(
+                same_name_tab,
+                "Another open tab already has the same file name.",
+            )
+            return
         self._write_file(tab, path)
         tab.filepath = path
         ext = os.path.splitext(path)[1].lower()
         tab.language = EXT_MAP.get(ext, "Plain Text")
-        idx = self.notebook.index(tab.frame)
-        self.notebook.tab(idx, text=f"  {os.path.basename(path)}  ")
+        self._update_tab_title(tab)
         self._highlight_syntax()
         self._update_status()
         self._add_recent(path)
@@ -814,51 +1169,448 @@ class PhilNotepadPlus:
             f.write(content)
         tab.modified = False
         tab.text.edit_modified(False)
-        idx = self.notebook.index(tab.frame)
-        title = os.path.basename(path) if path else "Untitled"
-        self.notebook.tab(idx, text=f"  {title}  ")
+        tab.last_known_size = self._get_file_size(path)
+        tab.last_known_mtime = self._get_file_mtime(path)
+        tab.needs_reload = False
+        self._update_tab_title(tab)
+        self._record_file_history(path)
+        self._save_history()
 
-    def _close_tab(self) -> None:
-        if not self.tabs:
-            return
+    # ── print preview / print ───────────────────────────────────────────
+    def _print_preview(self) -> None:
         tab = self.current_tab
         if not tab:
             return
+
+        title = self._tab_title(tab)
+        content = tab.text.get("1.0", "end-1c")
+        orientation = tk.StringVar(value="portrait")
+        page_index = tk.IntVar(value=0)
+
+        win = tk.Toplevel(self.root)
+        win.title("Print Preview - A4")
+        win.geometry("900x700")
+        win.minsize(720, 560)
+        win.transient(self.root)
+
+        toolbar = tk.Frame(win)
+        toolbar.pack(fill="x", padx=10, pady=8)
+
+        tk.Label(toolbar, text="Paper: A4").pack(side="left", padx=(0, 14))
+        tk.Radiobutton(toolbar, text="Portrait", variable=orientation, value="portrait").pack(side="left")
+        tk.Radiobutton(toolbar, text="Landscape", variable=orientation, value="landscape").pack(side="left", padx=(0, 14))
+
+        page_label = tk.Label(toolbar, width=14, anchor="center")
+        page_label.pack(side="left", padx=4)
+
+        canvas = tk.Canvas(win, bg="#7A7A7A", highlightthickness=0)
+        canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        pages: List[List[Tuple[Optional[int], str]]] = []
+
+        def rebuild_pages() -> None:
+            nonlocal pages
+            pages = self._paginate_for_a4(content, orientation.get())
+            page_index.set(min(page_index.get(), max(0, len(pages) - 1)))
+            draw_page()
+
+        def draw_page(event: Any = None) -> None:
+            canvas.delete("all")
+            if not pages:
+                page_label.config(text="Page 0 / 0")
+                return
+
+            idx = page_index.get()
+            page_label.config(text=f"Page {idx + 1} / {len(pages)}")
+
+            paper_w_mm, paper_h_mm = self._a4_dimensions(orientation.get())
+            margin = PRINT_MARGIN_MM
+            available_w = max(1, canvas.winfo_width() - 40)
+            available_h = max(1, canvas.winfo_height() - 40)
+            scale = min(available_w / paper_w_mm, available_h / paper_h_mm)
+            page_w = int(paper_w_mm * scale)
+            page_h = int(paper_h_mm * scale)
+            left = (canvas.winfo_width() - page_w) // 2
+            top = (canvas.winfo_height() - page_h) // 2
+
+            canvas.create_rectangle(left + 4, top + 4, left + page_w + 4, top + page_h + 4, fill="#555555", outline="")
+            canvas.create_rectangle(left, top, left + page_w, top + page_h, fill="#FFFFFF", outline="#D0D0D0")
+
+            text_left = left + int(margin * scale)
+            text_top = top + int(margin * scale)
+            preview_font_size = max(6, int(10 * scale / 2.8))
+            preview_font = (self.font_family, preview_font_size)
+            line_no_font = (self.font_family, max(5, preview_font_size - 1))
+            line_height = max(9, int(preview_font_size * 1.55))
+            line_no_width = max(18, int(preview_font_size * 3.8))
+            code_left = text_left + line_no_width + max(4, int(3 * scale))
+
+            canvas.create_text(
+                text_left,
+                text_top,
+                anchor="nw",
+                text=title,
+                fill="#444444",
+                font=(self.font_family, max(7, preview_font_size), "bold"),
+            )
+            y = text_top + line_height * 2
+            for line_no, line in pages[idx]:
+                if y > top + page_h - int(margin * scale):
+                    break
+                if line_no is not None:
+                    canvas.create_text(
+                        text_left + line_no_width,
+                        y,
+                        anchor="ne",
+                        text=str(line_no),
+                        fill="#A8A8A8",
+                        font=line_no_font,
+                    )
+                canvas.create_text(
+                    code_left,
+                    y,
+                    anchor="nw",
+                    text=line,
+                    fill="#111111",
+                    font=preview_font,
+                )
+                y += line_height
+
+        def prev_page() -> None:
+            if page_index.get() > 0:
+                page_index.set(page_index.get() - 1)
+                draw_page()
+
+        def next_page() -> None:
+            if page_index.get() < len(pages) - 1:
+                page_index.set(page_index.get() + 1)
+                draw_page()
+
+        tk.Button(toolbar, text="Previous", command=prev_page).pack(side="left", padx=2)
+        tk.Button(toolbar, text="Next", command=next_page).pack(side="left", padx=2)
+        tk.Button(toolbar, text="Print", command=lambda: self._print_current_tab(tab, orientation.get())).pack(side="right", padx=(8, 0))
+        tk.Button(toolbar, text="Close", command=win.destroy).pack(side="right")
+
+        orientation.trace_add("write", lambda *_: rebuild_pages())
+        canvas.bind("<Configure>", draw_page)
+        rebuild_pages()
+
+    def _a4_dimensions(self, orientation: str) -> Tuple[int, int]:
+        width, height = A4_SIZE_MM
+        return (height, width) if orientation == "landscape" else (width, height)
+
+    def _paginate_for_a4(self, content: str, orientation: str) -> List[List[Tuple[Optional[int], str]]]:
+        paper_w_mm, paper_h_mm = self._a4_dimensions(orientation)
+        body_w_mm = paper_w_mm - (PRINT_MARGIN_MM * 2)
+        body_h_mm = paper_h_mm - (PRINT_MARGIN_MM * 2)
+        px_per_mm = 96 / 25.4
+
+        print_font = tkfont.Font(family=self.font_family, size=10)
+        char_width = max(1, print_font.measure("M"))
+        line_height = max(1, print_font.metrics("linespace"))
+        line_no_width_px = print_font.measure("00000 ")
+        chars_per_line = max(24, int(((body_w_mm * px_per_mm) - line_no_width_px) / char_width))
+        lines_per_page = max(12, int((body_h_mm * px_per_mm) / line_height) - 2)
+
+        wrapped_lines: List[Tuple[Optional[int], str]] = []
+        for source_line_no, raw_line in enumerate(content.expandtabs(4).splitlines() or [""], start=1):
+            if raw_line == "":
+                wrapped_lines.append((source_line_no, ""))
+                continue
+            chunks = textwrap.wrap(
+                raw_line,
+                width=chars_per_line,
+                replace_whitespace=False,
+                drop_whitespace=False,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            if not chunks:
+                wrapped_lines.append((source_line_no, ""))
+                continue
+            wrapped_lines.append((source_line_no, chunks[0]))
+            wrapped_lines.extend((None, chunk) for chunk in chunks[1:])
+
+        pages = [
+            wrapped_lines[i:i + lines_per_page]
+            for i in range(0, len(wrapped_lines), lines_per_page)
+        ]
+        return pages or [[(1, "")]]
+
+    def _print_current_tab(self, tab: EditorTab, orientation: str) -> None:
+        content = tab.text.get("1.0", "end-1c")
+        title = self._tab_title(tab)
+        html_path = self._write_print_html(title, content, orientation)
+        try:
+            webbrowser.open(self._path_to_file_url(html_path))
+        except Exception as exc:
+            messagebox.showerror("Print", f"Unable to open the Windows print dialog:\n{exc}")
+
+    def _write_print_html(self, title: str, content: str, orientation: str) -> str:
+        safe_title = html_escape(title)
+        page_orientation = "landscape" if orientation == "landscape" else "portrait"
+        source_lines = content.expandtabs(4).splitlines() or [""]
+        line_count = len(source_lines)
+        line_no_digits = max(2, len(str(line_count)))
+
+        def render_line(line_no: int, text: str) -> str:
+            return (
+                "<div class=\"print-line\">"
+                f"<span class=\"line-no\">{line_no}</span>"
+                f"<span class=\"code-line\">{html_escape(text)}</span>"
+                "</div>"
+            )
+
+        lines_html = "\n".join(
+            render_line(line_no, line)
+            for line_no, line in enumerate(source_lines, start=1)
+        )
+        html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{safe_title}</title>
+<style>
+@page {{
+  size: A4 {page_orientation};
+  margin: {PRINT_MARGIN_MM}mm;
+}}
+html, body {{
+  margin: 0;
+  padding: 0;
+}}
+body {{
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 10pt;
+  line-height: 1.35;
+  color: #000;
+}}
+h1 {{
+  font-size: 11pt;
+  margin: 0 0 8mm 0;
+  font-weight: 700;
+}}
+.print-code {{
+  display: block;
+  max-width: 100%;
+}}
+.print-line {{
+  display: grid;
+  grid-template-columns: {line_no_digits + 1}ch minmax(0, 1fr);
+  column-gap: 1.5ch;
+  min-height: 1.35em;
+  align-items: start;
+}}
+.line-no {{
+  color: #B8B8B8;
+  text-align: right;
+  user-select: none;
+  white-space: pre;
+}}
+.code-line {{
+  min-width: 0;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  line-break: anywhere;
+}}
+</style>
+<script>
+window.addEventListener('load', function () {{
+  setTimeout(function () {{ window.print(); }}, 300);
+}});
+</script>
+</head>
+<body>
+<h1>{safe_title}</h1>
+<div class="print-code">
+{lines_html}
+</div>
+</body>
+</html>
+"""
+        fd, path = tempfile.mkstemp(prefix="phil_notepad_print_", suffix=".html", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(html)
+        return path
+
+    def _path_to_file_url(self, path: str) -> str:
+        return "file:///" + os.path.abspath(path).replace("\\", "/")
+
+    def _close_tab(self, tab: Optional[EditorTab] = None) -> bool:
+        if not self.tabs:
+            return False
+        tab = tab or self.current_tab
+        if not tab:
+            return False
         if tab.text.edit_modified():
+            self._select_tab(tab)
             ans = messagebox.askyesnocancel("Save?", "Do you want to save changes before closing?")
             if ans is None:
-                return
+                return False
             if ans:
                 self._save_file()
         idx = self.notebook.index(tab.frame)
         self.notebook.forget(idx)
         self.tabs.remove(tab)
         if self.tabs:
-            self.notebook.select(self.tabs[-1].frame)
+            next_idx = min(idx, len(self.tabs) - 1)
+            self.notebook.select(self.tabs[next_idx].frame)
         else:
             self.current_tab = None
         self._save_session()
+        self._rebuild_window_menu()
+        return True
+
+    def _close_all_tabs(self) -> None:
+        for tab in list(self.tabs):
+            if not self._close_tab(tab):
+                break
+
+    def _close_other_tabs(self) -> None:
+        keep = self.current_tab
+        if not keep:
+            return
+        for tab in list(self.tabs):
+            if tab is keep:
+                continue
+            if not self._close_tab(tab):
+                break
+        self._select_tab(keep)
+
+    def _select_tab(self, tab: EditorTab) -> None:
+        if tab in self.tabs:
+            self.notebook.select(tab.frame)
+            self.current_tab = tab
+            self._update_status()
 
     def _add_recent(self, path: str) -> None:
         if path in self.recent_files:
             self.recent_files.remove(path)
         self.recent_files.insert(0, path)
         self.recent_files = self.recent_files[:20]
+        self._record_file_history(path)
         self._rebuild_recent_menu()
+        self._save_history()
+        self._save_session()
 
     def _open_recent(self, path: str) -> None:
         if not os.path.exists(path):
             messagebox.showerror("Error", f"File not found:\n{path}")
             return
+        if not self._can_open_file_path(path):
+            return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="latin-1") as f:
-                content = f.read()
+            content = self._read_text_file(path)
+        except Exception as exc:
+            messagebox.showerror("Open File", f"Unable to open file:\n{path}\n\n{exc}")
+            return
         ext = os.path.splitext(path)[1].lower()
         lang = EXT_MAP.get(ext, "Plain Text")
         self._new_tab(title=os.path.basename(path), content=content, filepath=path, language=lang)
+        self._add_recent(path)
+
+    # ── window/tab management ───────────────────────────────────────────
+    def _tab_title(self, tab: EditorTab) -> str:
+        try:
+            idx = self.notebook.index(tab.frame)
+            return self._clean_tab_title(self.notebook.tab(idx, "text"))
+        except Exception:
+            return os.path.basename(tab.filepath) if tab.filepath else "Untitled"
+
+    def _tab_sort_key(self, tab: EditorTab) -> Tuple[str, str]:
+        return ((tab.filepath or self._tab_title(tab)).lower(), self._tab_title(tab).lower())
+
+    def _rebuild_window_menu(self) -> None:
+        if not hasattr(self, "window_menu"):
+            return
+        menu = self.window_menu
+        menu.delete(0, "end")
+        has_tabs = bool(self.tabs)
+        menu.add_command(label="Next Window        Ctrl+Tab", command=self._next_tab, state=("normal" if has_tabs else "disabled"))
+        menu.add_command(label="Previous Window    Ctrl+Shift+Tab", command=self._previous_tab, state=("normal" if has_tabs else "disabled"))
+        menu.add_separator()
+        menu.add_command(label="Move Window Left", command=lambda: self._move_current_tab(-1), state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_command(label="Move Window Right", command=lambda: self._move_current_tab(1), state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_command(label="Sort Windows by Name", command=self._sort_tabs_by_name, state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_separator()
+        menu.add_command(label="Reload Current Window", command=self._reload_current_file, state=("normal" if self.current_tab and self.current_tab.filepath else "disabled"))
+        menu.add_separator()
+        menu.add_command(label="Close Window       Ctrl+W", command=self._close_tab, state=("normal" if has_tabs else "disabled"))
+        menu.add_command(label="Close Other Windows", command=self._close_other_tabs, state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_command(label="Close All Windows", command=self._close_all_tabs, state=("normal" if has_tabs else "disabled"))
+        if not self.tabs:
+            return
+        menu.add_separator()
+        for i, tab in enumerate(self.tabs, start=1):
+            marker = "✓ " if tab is self.current_tab else "  "
+            reload_marker = " [Reload]" if tab.needs_reload else ""
+            label = f"{marker}{i}. {self._tab_title(tab)}{reload_marker}"
+            menu.add_command(label=label, command=lambda t=tab: self._select_tab(t))
+
+    def _show_tab_menu(self, event: Any) -> None:
+        tab = self._tab_at_event(event)
+        if not tab:
+            return
+        self._select_tab(tab)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Select", command=lambda: self._select_tab(tab))
+        menu.add_separator()
+        menu.add_command(label="Move Left", command=lambda: self._move_tab(tab, -1), state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_command(label="Move Right", command=lambda: self._move_tab(tab, 1), state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_command(label="Sort by Name", command=self._sort_tabs_by_name, state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_separator()
+        menu.add_command(label="Reload", command=lambda: self._reload_tab(tab), state=("normal" if tab.filepath else "disabled"))
+        menu.add_separator()
+        menu.add_command(label="Close", command=lambda: self._close_tab(tab))
+        menu.add_command(label="Close Others", command=self._close_other_tabs, state=("normal" if len(self.tabs) > 1 else "disabled"))
+        menu.add_command(label="Close All", command=self._close_all_tabs)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _tab_at_event(self, event: Any) -> Optional[EditorTab]:
+        try:
+            idx = self.notebook.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return None
+        if 0 <= idx < len(self.tabs):
+            return self.tabs[idx]
+        return None
+
+    def _close_tab_at_event(self, event: Any) -> str:
+        tab = self._tab_at_event(event)
+        if tab:
+            self._close_tab(tab)
+        return "break"
+
+    def _move_current_tab(self, delta: int) -> None:
+        if self.current_tab:
+            self._move_tab(self.current_tab, delta)
+
+    def _move_tab(self, tab: EditorTab, delta: int) -> None:
+        if tab not in self.tabs or len(self.tabs) < 2:
+            return
+        old_idx = self.tabs.index(tab)
+        new_idx = max(0, min(len(self.tabs) - 1, old_idx + delta))
+        if old_idx == new_idx:
+            return
+        self.tabs.pop(old_idx)
+        self.tabs.insert(new_idx, tab)
+        self.notebook.insert(new_idx, tab.frame)
+        self._select_tab(tab)
+        self._rebuild_window_menu()
+
+    def _sort_tabs_by_name(self) -> None:
+        current = self.current_tab
+        self.tabs.sort(key=self._tab_sort_key)
+        for idx, tab in enumerate(self.tabs):
+            self.notebook.insert(idx, tab.frame)
+        if current:
+            self._select_tab(current)
+        self._rebuild_window_menu()
 
     # ── edit helpers ────────────────────────────────────────────────────
     def _undo(self) -> None:
@@ -1018,15 +1770,74 @@ class PhilNotepadPlus:
         for tab in self.tabs:
             tab.text.config(font=fnt)
         self._redraw_line_numbers()
+        self._update_a4_margin_guides()
         self._update_status()
 
     # ── word wrap ───────────────────────────────────────────────────────
     def _toggle_word_wrap(self) -> None:
         self.word_wrap = not self.word_wrap
-        wrap = "word" if self.word_wrap else "none"
         for tab in self.tabs:
-            tab.text.config(wrap=wrap)
+            self._apply_word_wrap_to_tab(tab)
         self._redraw_line_numbers()
+        self._save_session()
+
+    def _apply_word_wrap_to_tab(self, tab: EditorTab) -> None:
+        if self.word_wrap:
+            tab.text.config(wrap="word", xscrollcommand="")
+            tab.text.xview_moveto(0)
+            if tab.hscroll is not None:
+                tab.hscroll.pack_forget()
+            self._update_a4_margin_guide(tab)
+            return
+
+        tab.text.config(wrap="none")
+        if tab.hscroll is None or not tab.hscroll.winfo_exists():
+            tab.hscroll = tk.Scrollbar(tab.frame, orient="horizontal", command=tab.text.xview)
+        tab.hscroll.pack(side="bottom", fill="x")
+        tab.text.config(xscrollcommand=tab.hscroll.set)
+        self._update_a4_margin_guide(tab)
+
+    def _toggle_a4_margin_guide(self) -> None:
+        self.show_a4_margin_guide = not self.show_a4_margin_guide
+        self._update_a4_margin_guides()
+        self._save_session()
+
+    def _a4_margin_guide_color(self) -> str:
+        return "#4A90E2" if self.theme_name == "Light" else "#5A8CC8"
+
+    def _a4_margin_column(self) -> int:
+        paper_w_mm, _ = self._a4_dimensions("portrait")
+        body_w_mm = paper_w_mm - (PRINT_MARGIN_MM * 2)
+        px_per_mm = 96 / 25.4
+        guide_font = tkfont.Font(family=self.font_family, size=self.font_size)
+        char_width = max(1, guide_font.measure("M"))
+        return max(24, int((body_w_mm * px_per_mm) / char_width))
+
+    def _update_a4_margin_guides(self) -> None:
+        for tab in self.tabs:
+            self._update_a4_margin_guide(tab)
+
+    def _update_a4_margin_guide(self, tab: EditorTab) -> None:
+        guide = tab.margin_guide
+        if guide is None:
+            return
+        if not self.show_a4_margin_guide:
+            guide.place_forget()
+            return
+        try:
+            tab.text.update_idletasks()
+            font_obj = tkfont.Font(font=tab.text["font"])
+            char_width = max(1, font_obj.measure("M"))
+            x = int(tab.text.cget("padx")) + (self._a4_margin_column() * char_width)
+            visible_width = max(1, tab.text.winfo_width())
+            if x < 0 or x > visible_width:
+                guide.place_forget()
+                return
+            guide.configure(bg=self._a4_margin_guide_color())
+            guide.place(x=x, y=0, width=1, relheight=1)
+            guide.lift()
+        except Exception:
+            guide.place_forget()
 
     # ── language ────────────────────────────────────────────────────────
     def _set_language(self, lang: str) -> None:
@@ -1090,10 +1901,7 @@ class PhilNotepadPlus:
         if tab.text.edit_modified():
             if not tab.modified:
                 tab.modified = True
-                idx = self.notebook.index(tab.frame)
-                title = self.notebook.tab(idx, "text").strip()
-                if not title.startswith("*"):
-                    self.notebook.tab(idx, text=f" *{title} ")
+                self._update_tab_title(tab)
         self._highlight_syntax()
         self._redraw_line_numbers()
         self._update_status()
@@ -1110,6 +1918,12 @@ class PhilNotepadPlus:
         menu.add_command(label="Cut", command=self._cut)
         menu.add_command(label="Copy", command=self._copy)
         menu.add_command(label="Paste", command=self._paste)
+        menu.add_separator()
+        menu.add_command(
+            label="Reload",
+            command=lambda: self._reload_tab(tab),
+            state=("normal" if tab.filepath else "disabled"),
+        )
         menu.add_separator()
         menu.add_command(label="Select All", command=self._select_all)
         menu.add_command(label="Delete", command=lambda: tab.text.delete("sel.first", "sel.last"))
@@ -1151,8 +1965,11 @@ class PhilNotepadPlus:
                 selectforeground=t["select_fg"],
             )
             tab.line_nums.config(bg=t["line_bg"])
+            if tab.margin_guide is not None:
+                tab.margin_guide.configure(bg=self._a4_margin_guide_color())
         self._highlight_syntax()
         self._redraw_line_numbers()
+        self._update_a4_margin_guides()
 
     # ── next tab ────────────────────────────────────────────────────────
     def _next_tab(self) -> None:
@@ -1161,6 +1978,13 @@ class PhilNotepadPlus:
         idx = self.notebook.index(self.notebook.select())
         nxt = (idx + 1) % len(self.tabs)
         self.notebook.select(self.tabs[nxt].frame)
+
+    def _previous_tab(self) -> None:
+        if len(self.tabs) < 2:
+            return
+        idx = self.notebook.index(self.notebook.select())
+        prev = (idx - 1) % len(self.tabs)
+        self.notebook.select(self.tabs[prev].frame)
 
     # ── about ───────────────────────────────────────────────────────────
     def _show_about(self) -> None:
